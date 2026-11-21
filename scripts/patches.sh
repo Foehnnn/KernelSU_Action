@@ -361,6 +361,64 @@ kpm_patch_image() {
 	endgroup
 }
 
+# ============================================ public tree Kconfig sanitizer
+
+# OPPO's open-source drop references private OPLUS_*/vendor directories from
+# Kconfig files, guarded by '#ifdef SOME_FEATURE' *comment* lines. Upstream
+# kconfig has no such mechanism: it reads those lines as plain comments and then
+# tries to load every `source` unconditionally, aborting the whole parse on the
+# first missing file ("cannot open file ..."). This walks every Kconfig in the
+# tree and comments out `source` lines whose target does not exist.
+sanitize_public_tree() {
+	group "Sanitizing dangling Kconfig sources"
+	local py
+	py=$(mktemp)
+	cat >"$py" <<'PYEOF'
+import os, re, sys
+
+root = sys.argv[1]
+pat = re.compile(r'^([ \t]*)source[ \t]+("[^"]+"|\S+)[ \t]*$')
+touched = []
+
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in ('.git', '.repo', '.cache')]
+    for name in filenames:
+        if name != 'Kconfig' and not name.startswith('Kconfig'):
+            continue
+        path = os.path.join(dirpath, name)
+        try:
+            with open(path, 'r', encoding='utf-8', errors='surrogateescape') as fh:
+                lines = fh.read().split('\n')
+        except OSError:
+            continue
+
+        out = []
+        changed = 0
+        for line in lines:
+            m = pat.match(line)
+            if m:
+                indent = m.group(1)
+                target = m.group(2).strip('"')
+                if '$' not in target and not os.path.exists(os.path.join(root, target)):
+                    out.append('%s# %s' % (indent, line[len(indent):]))
+                    changed += 1
+                    touched.append('%s -> %s' % (os.path.relpath(path, root), target))
+                    continue
+            out.append(line)
+
+        if changed:
+            with open(path, 'w', encoding='utf-8', errors='surrogateescape') as fh:
+                fh.write('\n'.join(out))
+
+for item in touched:
+    print('  commented: %s' % item)
+print('  total: %d dangling reference(s)' % len(touched))
+PYEOF
+	python3 "$py" "${KERNEL_DIR}" || warn "sanitizer failed; continuing with the tree as-is"
+	rm -f "$py"
+	endgroup
+}
+
 # --------------------------------------------------------------------- main ---
 
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
@@ -369,8 +427,14 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 		path_umount)  path_umount_apply ;;
 		hide_stuff)   hide_stuff_apply ;;
 		hooks)        hooks_patch_apply ;;
+		sanitize)     sanitize_public_tree ;;
 		kpm)          kpm_patch_image "$2" ;;
 		all)
+			# Do this first: the parser runs in the build step, and any
+			# Kconfig that still points at a stripped private directory
+			# aborts the whole build before a single file is compiled.
+			sanitize_public_tree
+
 			# Order matters and this is the tested one (4.19 + SukiSU builtin
 			# + SUSFS 1.5.5, no rejects):
 			#   path_umount and the hook patches both key off textual anchors
