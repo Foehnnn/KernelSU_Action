@@ -377,13 +377,26 @@ sanitize_public_tree() {
 import os, re, sys
 
 root = sys.argv[1]
-pat = re.compile(r'^([ \t]*)source[ \t]+("[^"]+"|\S+)[ \t]*$')
+# Kconfig:  source "<path>"   (with or without quotes)
+kconf_pat = re.compile(r'^([ \t]*)source[ \t]+("[^"]+"|\S+)[ \t]*$')
+# Makefile: obj-y += dir/  |  obj-$(CONFIG_X) += dir/  |  lib-y += dir/
+obj_pat = re.compile(r'^([ \t]*)(?:obj|lib|build|subdir)-[^=\n]*=[ \t]*([^\s#]+/)[ \t]*(?:#.*)?$')
+
 touched = []
+
+def obj_dir_ok(target_dir):
+    """A directory referenced as 'foo/' must exist and carry a Makefile/Kbuild."""
+    full = os.path.join(root, target_dir)
+    if not os.path.isdir(full):
+        return False
+    return any(os.path.isfile(os.path.join(full, n)) for n in ('Makefile', 'Kbuild'))
 
 for dirpath, dirnames, filenames in os.walk(root):
     dirnames[:] = [d for d in dirnames if d not in ('.git', '.repo', '.cache')]
     for name in filenames:
-        if name != 'Kconfig' and not name.startswith('Kconfig'):
+        is_kconf = name == 'Kconfig' or name.startswith('Kconfig')
+        is_make = name in ('Makefile', 'Kbuild')
+        if not (is_kconf or is_make):
             continue
         path = os.path.join(dirpath, name)
         try:
@@ -395,15 +408,25 @@ for dirpath, dirnames, filenames in os.walk(root):
         out = []
         changed = 0
         for line in lines:
-            m = pat.match(line)
-            if m:
-                indent = m.group(1)
-                target = m.group(2).strip('"')
-                if '$' not in target and not os.path.exists(os.path.join(root, target)):
-                    out.append('%s# %s' % (indent, line[len(indent):]))
-                    changed += 1
-                    touched.append('%s -> %s' % (os.path.relpath(path, root), target))
-                    continue
+            hit = None
+            if is_kconf:
+                m = kconf_pat.match(line)
+                if m:
+                    target = m.group(2).strip('"')
+                    if '$' not in target and not os.path.exists(os.path.join(root, target)):
+                        hit = target
+            elif is_make:
+                m = obj_pat.match(line)
+                if m:
+                    target = m.group(2)
+                    if '$' not in target and not obj_dir_ok(target):
+                        hit = target
+            if hit is not None:
+                indent = line[:len(line) - len(line.lstrip())]
+                out.append('%s# %s' % (indent, line[len(indent):]))
+                changed += 1
+                touched.append('%s -> %s' % (os.path.relpath(path, root), hit))
+                continue
             out.append(line)
 
         if changed:
