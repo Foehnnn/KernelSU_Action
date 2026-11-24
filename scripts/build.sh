@@ -20,6 +20,22 @@ DEFCONFIG_PATH="${KERNEL_DIR}/arch/${ARCH}/configs/${KERNEL_CONFIG}"
 
 prepare_defconfig() {
 	group "Preparing defconfig"
+	# --- diagnostics added for the failing CI run (safe to keep) -------------
+	info "KERNEL_CONFIG='${KERNEL_CONFIG:-<unset>}'  ARCH='${ARCH:-<unset>}'"
+	info "KERNEL_DIR=${KERNEL_DIR}"
+	info "WORKSPACE=${WORKSPACE}"
+	info "DEFCONFIG_PATH=${DEFCONFIG_PATH}"
+	info "KSU_VARIANT='${KSU_VARIANT:-}' HOOK_MODE='${KSU_HOOK_MODE:-}' RESOLVED='${KSU_HOOK_MODE_RESOLVED:-<unset>}'"
+	if [ -f "${DEFCONFIG_PATH}" ]; then
+		info "defconfig present: $(wc -c <"${DEFCONFIG_PATH}" | tr -d ' ') bytes, writable=$([ -w "${DEFCONFIG_PATH}" ] && echo yes || echo NO)"
+	else
+		warn "defconfig MISSING: ${DEFCONFIG_PATH}"
+		warn "listing of ${KERNEL_DIR}/arch/${ARCH:-arm64}/configs:"
+		ls -l "${KERNEL_DIR}/arch/${ARCH:-arm64}/configs" 2>&1 | head -n 40 || true
+	fi
+	df -h "${WORKSPACE}" "${KERNEL_DIR}" 2>&1 | sed 's/^/    /' || true
+	info "inodes: $(df -i "${WORKSPACE}" 2>/dev/null | tail -n 1)"
+	# ------------------------------------------------------------------------
 	[ -f "$DEFCONFIG_PATH" ] \
 		|| die "defconfig not found: arch/${ARCH}/configs/${KERNEL_CONFIG}
        Available: $(ls "${KERNEL_DIR}/arch/${ARCH}/configs/" | head -20 | tr '\n' ' ')"
@@ -187,7 +203,15 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 		defconfig) prepare_defconfig ;;
 		compile)   build_kernel ;;
 		check)     check_output ;;
-		all)       prepare_defconfig; build_kernel; check_output ;;
+		all)
+		( set -E
+		  trap 'printf "::error::build.sh failed at line %s: %s\n" "$LINENO" "$BASH_COMMAND"' ERR
+		  prepare_defconfig
+		  build_kernel
+		  check_output
+		) || exit 1
+		;;
 		*) die "unknown build step '$1'" ;;
 	esac
 fi
+#（注：内容由AI生成）
