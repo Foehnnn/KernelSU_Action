@@ -373,7 +373,10 @@ detect_defconfig() {
 		return 0
 	fi
 	local best
-	best=$(grep -l 'CONFIG_MTK_PLATFORM' "${cfgdir}"/*_defconfig 2>/dev/null | head -n1)
+	best=$(grep -l 'CONFIG_MTK_PLATFORM' "${cfgdir}"/oplus*_defconfig "${cfgdir}"/oppo*_defconfig 2>/dev/null | head -n1 || true)
+	if [ -z "${best}" ]; then
+		best=$(grep -l 'CONFIG_MTK_PLATFORM' "${cfgdir}"/*_defconfig 2>/dev/null | head -n1 || true)
+	fi
 	[ -n "${best}" ] && { echo "${best}"; return 0; }
 	return 1
 }
@@ -430,10 +433,19 @@ for dirpath, dirnames, filenames in os.walk(root):
             continue
         composites = set()
         if is_make:
+            # Any "<name>-<suffix>[:+]?=" definition means "<name>.o" is built from
+            # several objects -- including the "<name>-objs-y :=" and
+            # "<name>-objs := $(<name>-objs-y)" / "<name>-y +=" spellings, which an
+            # anchored (?:objs|y) regex misses (that silently commented
+            # "obj-y += isofs.o" and broke fs/built-in.o).
             for line in lines:
-                mc = re.match(r'^([A-Za-z0-9_.\-]+)-(?:objs|y|\$\([A-Za-z0-9_]+\))\s*[:+]?=\s*(.*)$', line)
-                if mc and '.o' in mc.group(2):
+                mc = re.match(r'^[ \t]*([A-Za-z0-9_.\-]+)-[A-Za-z0-9_.$()\-]*[ \t]*[:+]?=', line)
+                if mc:
                     composites.add(mc.group(1))
+        # A Makefile that generates .c files from another format (logos from
+        # .pbm/.ppm, tables from scripts) never has the .o on disk before the
+        # build, so treating "no such file" as "stripped" wrongly drops them.
+        gen_c = bool(re.search(r'^[^\s:#][^:]*%\.c[^:]*:', '\n'.join(lines), re.M))
         out, changed = [], 0
         for line in lines:
             hit = None
@@ -447,7 +459,8 @@ for dirpath, dirnames, filenames in os.walk(root):
                 m = obj_pat.match(line)
                 if m:
                     target = m.group(2)
-                    if '$' not in target and not obj_target_ok(dirpath, target, composites):
+                    if '$' not in target and not gen_c \
+                       and not obj_target_ok(dirpath, target, composites):
                         hit = target
             if hit is not None:
                 indent = line[:len(line) - len(line.lstrip())]
@@ -535,6 +548,25 @@ DISABLE = [
     'DYNAMIC_TUNNING_SWAPPINESS',   # 'two_hundred' came from a stripped header
     'IMQ',                          # sk_buff extensions missing from the drop
     'NETFILTER_XT_TARGET_IMQ',
+    # Boot logos are generated from .pbm/.ppm by a pattern rule; the sanitizer
+    # cannot see the .c and drops the objects, which then leaves logo.c calling
+    # symbols nobody defines.  Android gets its splash from the bootloader, so
+    # the in-kernel logo is dead weight either way.
+    'LOGO',
+    'LOGO_LINUX_MONO',
+    'LOGO_LINUX_VGA16',
+    'LOGO_LINUX_CLUT224',
+    'LOGO_BLACKFIN_CLUT224',
+    'LOGO_BLACKFIN_VGA16',
+    'LOGO_DEC_CLUT224',
+    'LOGO_MAC_CLUT224',
+    'LOGO_PARISC_CLUT224',
+    'LOGO_SGI_CLUT224',
+    'LOGO_SUN_CLUT224',
+    'LOGO_SUPERH_MONO',
+    'LOGO_SUPERH_VGA16',
+    'LOGO_SUPERH_CLUT224',
+    'LOGO_M32R_CLUT224',
 ]
 
 env_mk = os.path.join(root, 'OplusKernelEnvConfig.mk')
@@ -989,11 +1021,138 @@ link_arm_assembler() {
 	ok "assembler alias -> ${real}"
 }
 
+
+# Some vendor Makefiles list both a composite object and the members it is
+# already built from ("mtk-vcu-y += mtk_vcu.o mtk_vcodec_mem.o" next to
+# "obj-... += mtk-vcu.o mtk_vcodec_mem.o").  kbuild then links the same .o
+# twice and the final lld link aborts with "duplicate symbol".
+dedupe_vendor_obj_lists() {
+	group "Deduplicating vendor obj lists"
+	python3 - "$KERNEL_DIR" <<'PYEOF'
+import os, re, sys
+
+root = sys.argv[1]
+obj_re = re.compile(r'^([ \t]*)((?:obj|lib|build)-(?:(?:y|m)|\$[^\s=]+)?[ \t]*\+?=[ \t]*)([^#\n]*)$')
+def_re = re.compile(r'^[ \t]*([A-Za-z0-9_.\-]+)-(?:y|objs)[ \t]*[:+]?=[ \t]*(.*)$')
+token = re.compile(r'([A-Za-z0-9_.\-]+\.o)')
+
+def logical(text):
+    lines = text.split('\n')
+    i = 0
+    while i < len(lines):
+        raw, joined = [lines[i]], lines[i]
+        while joined.endswith('\\') and i + 1 < len(lines):
+            joined = joined[:-1].rstrip() + ' ' + lines[i + 1].lstrip()
+            i += 1
+            raw.append(lines[i])
+        yield i, joined, raw
+        i += 1
+
+total = 0
+for dirpath, dirnames, files in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in ('out', '.git', '.repo')]
+    for f in files:
+        if f not in ('Makefile', 'Kbuild'):
+            continue
+        path = os.path.join(dirpath, f)
+        try:
+            text = open(path, encoding='utf-8', errors='surrogateescape').read()
+        except OSError:
+            continue
+        rows = list(logical(text))
+        members = {}
+        for _, joined, _ in rows:
+            m = def_re.match(joined)
+            if m:
+                members.setdefault(m.group(1), set()).update(token.findall(m.group(2)))
+        out, changed = text.split('\n'), False
+        for end, joined, raw in rows:
+            m = obj_re.match(joined)
+            if not m:
+                continue
+            items = token.findall(m.group(3))
+            if len(items) < 2:
+                continue
+            comps = {i[:-2] for i in items}
+            dup = sorted({i for i in items if any(i in members.get(c, ()) for c in comps)})
+            if not dup:
+                continue
+            for d in dup:
+                joined = re.sub(r'(?<![A-Za-z0-9_.\-])' + re.escape(d) + r'(?=\s|\\|$)', '', joined)
+            out[end - len(raw) + 1:end + 1] = [re.sub(r'[ \t]+$', '', joined)]
+            changed = True
+            total += len(dup)
+            print('  %s: dropped %s' % (os.path.relpath(path, root), ', '.join(dup)))
+        if changed:
+            open(path, 'w', encoding='utf-8', errors='surrogateescape').write('\n'.join(out))
+print('  redundant object references dropped: %d' % total)
+PYEOF
+	endgroup
+}
+
+
+# Symbols that the public drop still references but no longer defines.  Each
+# one is a vendor helper that used to live in a private tree; the call sites are
+# kept, so the final link fails with "undefined symbol" until somebody answers
+# for them.  Stubbed implementations go into their own directory so they are
+# compiled exactly once.
+install_symbol_stubs() {
+	group "Defining symbols the drop left undefined"
+	local dir="${KERNEL_DIR}/drivers/misc/mediatek/oplus_drop_stubs"
+	mkdir -p "$dir"
+	cat > "$dir/Makefile" <<'MKEOF'
+obj-y += stubs.o
+MKEOF
+	cat > "$dir/stubs.c" <<'CEOF'
+/* Implementations of vendor helpers whose sources are absent from the drop. */
+#include <linux/types.h>
+#include <linux/kernel.h>
+#include <linux/string.h>
+
+#ifndef __HAVE_ARCH_STPCPY
+/* lib/string.c lost this along with the rest of the OPPO additions. */
+char *stpcpy(char *dest, const char *src)
+{
+	char *d = dest;
+
+	while ((*d = *src) != '\0') {
+		d++;
+		src++;
+	}
+
+	return d;
+}
+#endif
+
+unsigned int get_eng_version(void)
+{
+	/* 0 == user build; AGING (1) / FACTORY (2) would take vendor paths that
+	 * are not present in the public drop. */
+	return 0;
+}
+
+bool oplus_daily_build(void)
+{
+	return false;
+}
+
+int phx_is_system_boot_completed(void)
+{
+	return 1;
+}
+CEOF
+	if ! grep -q 'oplus_drop_stubs/' "${KERNEL_DIR}/drivers/misc/mediatek/Makefile"; then
+		printf '\nobj-y += oplus_drop_stubs/\n' >> "${KERNEL_DIR}/drivers/misc/mediatek/Makefile"
+	fi
+	ok "symbol stubs -> drivers/misc/mediatek/oplus_drop_stubs"
+	endgroup
+}
+
 # --------------------------------------------------------------------- main ---
 
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 	case "${1:-all}" in
-	sanitize|features|stubs|repair|aslink|all) ;;
+	sanitize|features|stubs|repair|buildfix|dedupe|symstubs|aslink|all) ;;
 	*) set -- all ;;
 	esac
 
@@ -1006,6 +1165,9 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 		features)     neutralize_stripped_hooks ;;
 		repair)       repair_stripped_upstream ;;
 		aslink)       link_arm_assembler ;;
+		buildfix)     freshen_vendor_build ;;
+		symstubs)     install_symbol_stubs ;;
+		dedupe)       dedupe_vendor_obj_lists ;;
 		stubs)        install_private_stubs ;;
 		kpm)          kpm_patch_image "$2" ;;
 		all)
@@ -1019,6 +1181,9 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 			neutralize_stripped_hooks
 			install_private_stubs
 			repair_stripped_upstream
+			freshen_vendor_build
+			install_symbol_stubs
+			dedupe_vendor_obj_lists
 
 			# Order matters and this is the tested one (4.19 + SukiSU builtin
 			# + SUSFS 1.5.5, no rejects):
