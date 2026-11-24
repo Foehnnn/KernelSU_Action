@@ -202,9 +202,14 @@ path_umount_apply() {
 		endgroup; return 0
 	fi
 
-	local anchor='Now umount can handle mount points as well as block devices'
+	# Anchor on the umount syscall definition itself: every tree from 4.9 to
+	# 5.4 defines do_umount()/check_mnt()/may_mount() before it, so the body
+	# always sees the helpers it calls.  Anchoring on the surrounding comment
+	# instead moved the insertion above those helpers on some vendor trees and
+	# produced implicit-declaration errors.
+	local anchor='SYSCALL_DEFINE2(umount'
 	grep -q "$anchor" "$ns" \
-		|| die "could not find the insertion point in fs/namespace.c; patch this kernel manually"
+		|| die "could not find the umount syscall in fs/namespace.c; patch this kernel manually"
 
 	local snippet
 	snippet=$(mktemp)
@@ -251,15 +256,9 @@ int path_umount(struct path *path, int flags)
 
 EOF
 
-	# Insert before the line *above* the anchor comment body, i.e. at the '/*'
-	# that opens it.
-	local lineno
-	lineno=$(grep -n "$anchor" "$ns" | head -n1 | cut -d: -f1)
-	# Walk back to the opening '/*' of that comment block.
-	local start=$lineno
-	while [ "$start" -gt 1 ] && ! sed -n "${start}p" "$ns" | grep -q '/\*'; do
-		start=$((start - 1))
-	done
+	# Insert directly in front of the umount syscall definition.
+	local start
+	start=$(grep -n "$anchor" "$ns" | head -n1 | cut -d: -f1)
 
 	local tmp
 	tmp=$(mktemp)
